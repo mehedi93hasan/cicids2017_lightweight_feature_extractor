@@ -386,6 +386,24 @@ class PacketToolApp(ctk.CTk):
         )
         self.btn_pcap.grid(row=1, column=1, padx=10, pady=5)
 
+        # Ground Truth CSV Input
+        ctk.CTkLabel(self.frame_files, text="Ground Truth CSV:", font=("Arial", 12, "bold")).grid(row=2, column=0, sticky="w", padx=10, pady=5)
+        self.entry_gt = ctk.CTkEntry(
+            self.frame_files, 
+            placeholder_text="Select Ground Truth CSV (optional)...", 
+            width=600
+        )
+        self.entry_gt.grid(row=3, column=0, padx=10, pady=5)
+        self.btn_gt = ctk.CTkButton(
+            self.frame_files, 
+            text="Browse",
+            fg_color="#555",
+            hover_color="#444",
+            command=lambda: self.browse_file(self.entry_gt, "csv"),
+            width=100
+        )
+        self.btn_gt.grid(row=3, column=1, padx=10, pady=5)
+
         # Progress Bar
         self.progress = ctk.CTkProgressBar(self, width=830)
         self.progress.pack(padx=20, pady=10, fill="x")
@@ -424,11 +442,12 @@ class PacketToolApp(ctk.CTk):
         self.log("\nOptimizations:")
         self.log("  • 100 packets max per flow (Memory efficient for Raspberry Pi)")
         self.log("  • Per-feature computational cost tracking (nanosecond precision)")
+        self.log("  • Ground Truth labeling support for supervised learning")
         self.log("  • Designed for real-time adversarial attack detection")
         self.log("\nOutputs:")
-        self.log("  • CSV 1: Complete feature dataset with all 30 features")
+        self.log("  • CSV 1: Complete feature dataset with labels (if GT provided)")
         self.log("  • CSV 2: Individual feature computational costs (not grouped)")
-        self.log("\nReady. Please select a CICIDS2017 PCAP file to begin.")
+        self.log("\nReady. Please select PCAP file and optionally Ground Truth CSV.")
         self.log("="*90 + "\n")
 
     def log(self, msg):
@@ -443,7 +462,10 @@ class PacketToolApp(ctk.CTk):
         self.update_idletasks()
 
     def browse_file(self, entry, ftype):
-        filetypes = [("PCAP Files", "*.pcap"), ("PCAPNG", "*.pcapng"), ("All Files", "*.*")]
+        if ftype == "pcap":
+            filetypes = [("PCAP Files", "*.pcap"), ("PCAPNG", "*.pcapng"), ("All Files", "*.*")]
+        else:
+            filetypes = [("CSV Files", "*.csv"), ("All Files", "*.*")]
             
         filename = ctk.filedialog.askopenfilename(filetypes=filetypes)
         if filename:
@@ -451,12 +473,13 @@ class PacketToolApp(ctk.CTk):
             entry.insert(0, filename)
             try:
                 file_size = os.path.getsize(filename) / 1024 / 1024
-                self.log(f"✓ Selected: {os.path.basename(filename)} ({file_size:.2f} MB)")
+                self.log(f"✓ Selected {ftype.upper()}: {os.path.basename(filename)} ({file_size:.2f} MB)")
             except:
-                self.log(f"✓ Selected: {os.path.basename(filename)}")
+                self.log(f"✓ Selected {ftype.upper()}: {os.path.basename(filename)}")
 
     def start_processing(self):
         pcap_path = self.entry_pcap.get()
+        gt_path = self.entry_gt.get()
         
         if not pcap_path:
             self.log("❌ Error: Please select a PCAP file.")
@@ -466,21 +489,113 @@ class PacketToolApp(ctk.CTk):
             self.log(f"❌ Error: PCAP file not found: {pcap_path}")
             return
         
+        # Ground Truth is optional
+        if gt_path and not os.path.exists(gt_path):
+            self.log(f"❌ Error: Ground Truth CSV not found: {gt_path}")
+            return
+        
         self.btn_process.configure(state="disabled", text="Processing...")
         self.update_progress(0, "Initializing...")
-        threading.Thread(target=self.run_logic, args=(pcap_path,), daemon=True).start()
+        threading.Thread(target=self.run_logic, args=(pcap_path, gt_path), daemon=True).start()
 
-    def run_logic(self, pcap_path):
+    def run_logic(self, pcap_path, gt_path=None):
         try:
             self.log("\n" + "="*90)
             self.log("STARTING LIGHTWEIGHT FEATURE EXTRACTION")
             self.log("="*90 + "\n")
             
             tracker = LightweightFlowTracker()
+            gt_lookup = {}
             
-            # Process PCAP
+            # STEP 1: Load Ground Truth (if provided)
+            if gt_path:
+                self.update_progress(0.02, "Loading Ground Truth...")
+                self.log("[1/4] Loading Ground Truth Labels...")
+                self.log(f"File: {os.path.basename(gt_path)}\n")
+                
+                try:
+                    # Try to read GT CSV
+                    df_gt = pd.read_csv(gt_path, encoding='latin-1', low_memory=False)
+                    
+                    # Normalize column names
+                    df_gt.columns = df_gt.columns.str.strip().str.lower().str.replace(' ', '_')
+                    
+                    # CICIDS2017 format typically has: Source IP, Source Port, Destination IP, Destination Port, Protocol, Label
+                    # Try different possible column names
+                    possible_src_ip = ['source_ip', 'src_ip', 'source ip', 'src ip', 'source_address']
+                    possible_dst_ip = ['destination_ip', 'dst_ip', 'destination ip', 'dst ip', 'destination_address']
+                    possible_src_port = ['source_port', 'src_port', 'source port', 'src port']
+                    possible_dst_port = ['destination_port', 'dst_port', 'destination port', 'dst port']
+                    possible_protocol = ['protocol', 'proto']
+                    possible_label = ['label', 'attack', 'attack_type', 'class', 'classification']
+                    
+                    # Find actual column names
+                    src_ip_col = next((col for col in df_gt.columns if col in possible_src_ip), None)
+                    dst_ip_col = next((col for col in df_gt.columns if col in possible_dst_ip), None)
+                    src_port_col = next((col for col in df_gt.columns if col in possible_src_port), None)
+                    dst_port_col = next((col for col in df_gt.columns if col in possible_dst_port), None)
+                    protocol_col = next((col for col in df_gt.columns if col in possible_protocol), None)
+                    label_col = next((col for col in df_gt.columns if col in possible_label), None)
+                    
+                    if not all([src_ip_col, dst_ip_col, src_port_col, dst_port_col, label_col]):
+                        self.log("⚠ Warning: Could not find all required columns in GT CSV")
+                        self.log(f"Available columns: {', '.join(df_gt.columns.tolist())}")
+                        self.log("Proceeding without labels...\n")
+                    else:
+                        # Build lookup dictionary
+                        for _, row in df_gt.iterrows():
+                            try:
+                                src_ip = str(row[src_ip_col]).strip()
+                                dst_ip = str(row[dst_ip_col]).strip()
+                                
+                                # Handle NaN values
+                                if src_ip.lower() == 'nan' or dst_ip.lower() == 'nan':
+                                    continue
+                                
+                                src_port = int(float(row[src_port_col])) if pd.notna(row[src_port_col]) else 0
+                                dst_port = int(float(row[dst_port_col])) if pd.notna(row[dst_port_col]) else 0
+                                
+                                # Protocol handling
+                                if protocol_col:
+                                    proto = str(row[protocol_col]).lower().strip()
+                                    # Convert protocol number to name if needed
+                                    if proto == '6' or proto == '6.0':
+                                        proto = 'tcp'
+                                    elif proto == '17' or proto == '17.0':
+                                        proto = 'udp'
+                                    elif proto == '1' or proto == '1.0':
+                                        proto = 'icmp'
+                                else:
+                                    proto = 'tcp'  # Default
+                                
+                                # Get label
+                                label = str(row[label_col]).strip()
+                                if label.lower() in ['nan', '', ' ']:
+                                    label = 'BENIGN'
+                                
+                                # Create bidirectional keys
+                                key_fwd = (src_ip, src_port, dst_ip, dst_port, proto)
+                                key_bwd = (dst_ip, dst_port, src_ip, src_port, proto)
+                                
+                                gt_lookup[key_fwd] = label
+                                gt_lookup[key_bwd] = label
+                                
+                            except Exception as e:
+                                continue
+                        
+                        self.log(f"✓ Loaded {len(gt_lookup):,} labeled flow entries from Ground Truth")
+                        self.log(f"✓ Unique flows: ~{len(gt_lookup)//2:,}\n")
+                
+                except Exception as e:
+                    self.log(f"⚠ Warning: Error loading Ground Truth: {e}")
+                    self.log("Proceeding without labels...\n")
+
+            # STEP 2: Process PCAP
+            step_num = 2 if gt_path else 1
+            total_steps = 4 if gt_path else 3
+            
             self.update_progress(0.05, "Reading PCAP file...")
-            self.log("[1/3] Processing PCAP and Extracting Features...")
+            self.log(f"[{step_num}/{total_steps}] Processing PCAP and Extracting Features...")
             self.log(f"File: {os.path.basename(pcap_path)}\n")
             
             count = 0
@@ -497,26 +612,86 @@ class PacketToolApp(ctk.CTk):
             self.log(f"✓ Total packets: {count:,}")
             self.log(f"✓ Total flows: {len(tracker.flows):,}\n")
 
-            # Extract Features
+            # STEP 3: Extract Features
+            step_num += 1
             self.update_progress(0.8, "Extracting features from flows...")
-            self.log("[2/3] Extracting 30 Lightweight Features from Flows...")
+            self.log(f"[{step_num}/{total_steps}] Extracting 30 Lightweight Features from Flows...")
             
             feature_list = tracker.get_all_features()
             df = pd.DataFrame(feature_list)
             
             self.log(f"✓ Extracted features from {len(df):,} flows\n")
 
-            # Save Outputs
+            # STEP 4: Match with Ground Truth Labels (if provided)
+            if gt_path and gt_lookup:
+                step_num += 1
+                self.update_progress(0.85, "Matching with Ground Truth labels...")
+                self.log(f"[{step_num}/{total_steps}] Matching Flows with Ground Truth Labels...")
+                
+                labels = []
+                matched_count = 0
+                
+                for _, row in df.iterrows():
+                    src_ip = row['src_ip']
+                    dst_ip = row['dst_ip']
+                    src_port = int(row['sport'])
+                    dst_port = int(row['dport'])
+                    
+                    # Convert protocol number to name
+                    proto_num = row['proto']
+                    if proto_num == 6:
+                        proto = 'tcp'
+                    elif proto_num == 17:
+                        proto = 'udp'
+                    elif proto_num == 1:
+                        proto = 'icmp'
+                    else:
+                        proto = 'other'
+                    
+                    # Try to find in GT lookup
+                    key_fwd = (src_ip, src_port, dst_ip, dst_port, proto)
+                    key_bwd = (dst_ip, dst_port, src_ip, src_port, proto)
+                    
+                    if key_fwd in gt_lookup:
+                        labels.append(gt_lookup[key_fwd])
+                        matched_count += 1
+                    elif key_bwd in gt_lookup:
+                        labels.append(gt_lookup[key_bwd])
+                        matched_count += 1
+                    else:
+                        labels.append('BENIGN')  # Default label for unmatched
+                
+                df['Label'] = labels
+                
+                self.log(f"✓ Matched {matched_count:,} flows to Ground Truth labels")
+                self.log(f"✓ Labeled {len(df)-matched_count:,} flows as 'BENIGN' (default)\n")
+                
+                # Show label distribution
+                self.log("Label Distribution:")
+                label_counts = df['Label'].value_counts()
+                for label, count in label_counts.items():
+                    percentage = (count / len(df)) * 100
+                    self.log(f"  {label:30s}: {count:6,} ({percentage:5.2f}%)")
+                self.log("")
+
+            # STEP 5: Save Outputs
+            step_num += 1
             self.update_progress(0.9, "Generating output files...")
-            self.log("[3/3] Generating Output Files...")
+            self.log(f"[{step_num}/{total_steps}] Generating Output Files...")
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            # Reorder columns - put Label at the end if it exists
+            if 'Label' in df.columns:
+                cols = [c for c in df.columns if c != 'Label']
+                cols.append('Label')
+                df = df[cols]
             
             # Save Feature Dataset
             dataset_file = f"CICIDS2017_30Features_{timestamp}.csv"
             df.to_csv(dataset_file, index=False)
             self.log(f"✓ Saved Feature Dataset: {dataset_file}")
             self.log(f"  → Total Flows: {len(df):,}")
-            self.log(f"  → Features: 30 (+ 5 identifiers)")
+            self.log(f"  → Features: 30 (+ 5 identifiers{' + Label' if 'Label' in df.columns else ''})")
             self.log(f"  → File Size: {os.path.getsize(dataset_file) / 1024:.2f} KB")
 
             # Save Per-Feature Computational Cost Analysis
@@ -675,9 +850,13 @@ class PacketToolApp(ctk.CTk):
             self.log("EXTRACTION SUMMARY")
             self.log("="*90)
             self.log(f"PCAP File:                   {os.path.basename(pcap_path)}")
+            if gt_path:
+                self.log(f"Ground Truth File:           {os.path.basename(gt_path)}")
             self.log(f"Total Packets Processed:     {tracker.packet_count:,}")
             self.log(f"Total Flows Extracted:       {len(df):,}")
             self.log(f"Features per Flow:           30 lightweight features")
+            if 'Label' in df.columns:
+                self.log(f"Labeled Flows:               {matched_count:,} ({matched_count/len(df)*100:.1f}%)")
             self.log(f"Memory Limit per Flow:       100 packets (deque optimization)")
             self.log(f"Processing Time:             {processing_time:.2f} seconds")
             self.log(f"Throughput:                  {tracker.packet_count/processing_time:.0f} packets/second")
@@ -689,7 +868,7 @@ class PacketToolApp(ctk.CTk):
                     pass
             self.log(f"\nOutput Files:")
             self.log(f"  1. {dataset_file}")
-            self.log(f"     → Complete feature dataset for ML training")
+            self.log(f"     → Complete feature dataset{' with labels' if 'Label' in df.columns else ''}")
             self.log(f"  2. {cost_file}")
             self.log(f"     → Per-feature computational costs for optimization")
             
@@ -699,6 +878,8 @@ class PacketToolApp(ctk.CTk):
             self.log("\nNext Steps:")
             self.log("  • Use CSV 1 for training adversarial-robust ML models")
             self.log("  • Analyze CSV 2 to identify bottlenecks for Raspberry Pi deployment")
+            if 'Label' in df.columns:
+                self.log("  • Train supervised models using the labeled dataset")
             self.log("  • Combine multiple PCAP files for comprehensive dataset creation")
             self.log("="*90 + "\n")
             
